@@ -1,0 +1,8 @@
+Data/
+*.log
+__pycache__/
+run.py
+run2.py
+run4.py
+run_copy.py
+add_transparency.py
