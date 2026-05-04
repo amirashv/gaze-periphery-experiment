@@ -1,0 +1,230 @@
+---
+title: A Psychphysics Study on Glance reading accuracy in the peripheral field
+author:
+  - name: Martin Schmettow
+    id: ut
+    orcid: 0000-0003-0240-4087
+    email: m.schmettow@utwente.nl
+    affiliation: 
+      - name: University of Twente
+        city: Enschede, NL
+        url: www.utwente.nl
+    attributes:
+        corresponding: true
+keywords:
+  - Psychophysics
+format: docx
+bibliography: references.bib
+date: last-modified
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: true
+---
+  
+# Data reading
+
+```{r}
+#! eval: false
+library(tidyverse)
+
+csv_files <- dir("data", pattern = "*.csv", full.names = T)
+
+read_gr <- function(f) {
+  read_csv(f, show_col_types = FALSE) |> 
+    filter(!is.na(xPos)) |> 
+    select(participant, xPos, stimulusSet, whichImage, thisN, blockNumber, direction, angle, stimulus, response, correct) |> 
+#    mutate(blockNumber = as.factor(blockNumber)) |> 
+    filter(!is.na(blockNumber))
+}
+
+T_blocks <-
+  tibble(blockNumber = c(1,2,3),
+         eccentricity = c(5, 10, 15))
+
+
+D_0 <- 
+  csv_files |> 
+  map_df(read_gr)
+
+read_gr(csv_files[1])
+
+D_1 <- 
+  D_0 |> 
+  left_join(T_blocks, by = join_by(blockNumber)) |> 
+  mutate(Part = as.factor(participant)) |>
+  group_by(Part) |> 
+  mutate(trial = row_number()) |>
+  ungroup() |> 
+  select(Part, trial, angle, eccentricity, correct) |> 
+  bayr::as_tbl_obs()
+
+summary(D_1)
+
+save(D_0, D_1, file = "Data.Rda")
+```
+
+# Exploration
+
+The following plot shows the population level proportion of correct responses as a function of the angle and eccentricity. There is huge fluctuations with angles below 10 degree, which is due to the adaptive staircase procedure, which results in fewer observations for these angles. The tendency above 10 degree is 
+
+```{r}
+#| fig-width: 8
+#| fig-height: 12
+
+T_1 <- D_1 |> 
+  summarize(p_correct = mean(correct),
+            n_Obs = n(),
+            .by = c(angle, eccentricity))
+  
+T_1 |> 
+  ggplot(aes(x = angle, color = as.factor(eccentricity), y = p_correct)) +
+  geom_point(aes(size = n_Obs )) +
+  geom_smooth(se = F, method = "loess")
+
+
+  
+```
+
+The figure below shows the proportion of correct responses as a function of the Angle (in three ranges) and eccentricity, separately for each participant.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 12
+
+D_1 |> 
+  mutate(Angle = case_when(
+    angle < 10 ~ "0-10",
+    angle < 15 ~ "10-15",
+    angle <= 20  ~ "15-20"
+  )) |>
+  summarize(p_correct = mean(correct),
+            n_Obs = n(),
+            .by = c(Part, Angle, eccentricity)) |> 
+  ggplot(aes(x = Angle, color = as.factor(eccentricity), y = p_correct)) +
+  facet_wrap(~Part) +
+  geom_point(aes(size = n_Obs), alpha = 0.5) +
+  geom_line(aes(group = eccentricity), alpha = 0.5)
+  
+```
+
+## Conclusion
+
+Many participants even the easiest condition don't improve beyond chance level. Only in a few do we observe a regular pattern that matches our expectations. Still, a subset of participants can perhaps be used with the model. Legit participants should show performance above chance level and have clear upwards trend, as well as the expected ordering of eccentricity.
+
+
+# Modelling
+
+The theoretically complete Psychophysics function would have:
+  + dprime
+  + a guessing rate
+  + a lapse rate (readout error)
+  + a decision bias
+  
+The theoretical base for lapse is that the response depends on the sensory characteristics and the readout process  [@Gold2013].
+
+
+```{r}
+inv_logit <- function(x) {
+  exp(x) / (1 + exp(x))
+}
+
+logit <- function(x) {
+  log(x / (1 - x))
+}
+
+pm_func <- function(x, dprime, lapse, bias, guess = 0.5) {
+  guess + (1 - guess - lapse) * inv_logit(dprime * x - bias)
+}
+```
+
+```{r}
+tibble(
+  x = seq(-10, 10, length.out = 100),
+  y = pm_func(x, dprime = 0.5, lapse = 0.05, bias = 0.6)
+) |> 
+  ggplot(aes(x, y)) +
+  geom_line()
+```
+
+
+
+```{r}
+#| eval: false
+# devtools::install_github("schmettow/bayr")
+
+```
+
+The lapse rate and decision bias are modeled as functions of the participant, but not of the eccentricity, because it is assumed to be a readout error that is independent of the stimulus. Dprime is modelled as a function of eccentricity.
+
+Since we have no data at the upper end of performance, the lapse parameter cannot be estimated neither on  participant level nor on population level. The same holds for the bias parameter. Therefore, a much simplified model is used.
+
+```{r}
+#| eval: false
+library(tidyverse)
+library(brms)
+
+F_1 <- bf(
+  correct ~ 0.5 + (1 - 0.5) * inv_logit(exp(dprime) * angle), 
+  dprime ~ 1 + eccentricity + (1 + eccentricity | Part),
+  #lapse ~ 1, 
+  nl = TRUE
+)
+
+Priors_1 <- c(
+  set_prior("normal( 0, 1)", nlpar = "dprime")
+  #set_prior("normal( 0, 0.5)", nlpar = "bias"),
+  #set_prior("normal(-2.2, 0.6)", nlpar = "lapse")
+)
+
+M_1 <- brm(
+  F_1,
+  data = D_1,
+  family = bernoulli(link = "identity"),
+  prior = Priors_1,
+  chains = 8,
+  cores = 8,
+  iter = 3000,
+  warmup = 2000,
+  control = list(adapt_delta = 0.99999999, max_treedepth = 12)
+)
+
+save(M_1, D_1, file = "M_1.Rda")
+
+```
+
+Here we extract the posterior samples. 
+
+```{r}
+library(bayr)
+load("M_1.Rda")
+P_1 <- bayr::posterior(M_1)
+
+```
+
+This extracts the population-level parameters. Parameters are transformed back to their original scale. Note that by the back-transformation `dprime` is a *multiplicative* parameters.
+
+```{r}
+fixef(P_1)
+```
+
+
+This figure shows the posterior distributrions of population-level parameters.
+
+```{r}
+P_1 |> 
+  filter(type == "fixef") |> 
+  ggplot(aes(x = value, col = parameter)) +
+  facet_grid(~nonlin) +
+  geom_density()
+
+```
+
+
+## Posterior predictions
+
+```{r}
+PP_1 <- bayr::post_pred(M_1, ndraws = 1000)
+```
+

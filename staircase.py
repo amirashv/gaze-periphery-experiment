@@ -2,26 +2,34 @@
 staircase.py
 ------------
 Bayesian adaptive staircase for 2AFC gaze-change detection.
+Uses 2-up/1-down rule with step-size halving after reversals.
 
 Two key outcomes per condition:
   1. Maximum detectable eccentricity (furthest bin not abandoned)
   2. Detection threshold magnitude at each active eccentricity
 
+Staircase rule
+--------------
+- 2-up/1-down: magnitude decreases after 2 consecutive correct responses,
+  increases after any single wrong response
+- Converges on ~70.7% correct threshold
+- Starting magnitude: 20° (near maximum, works downward)
+- Step size: 3° halving after every 2 reversals, minimum 1°
+
 Abandon logic
 -------------
-- Each bin is evaluated independently — no cascade assumption
-- A bin is abandoned using a Bayesian Beta-Binomial model after MIN_TRIALS_BEFORE_ABANDON trials
-- Prior: Beta(1,1) flat prior — no assumption about participant ability
-- Posterior: Beta(k+1, n-k+1) updated with observed correct/incorrect responses
-- Decision: abandon if P(true detection rate > 0.5 | data) < ABANDON_THRESHOLD (0.80)
-- At 15 trials: corresponds to 9 or fewer correct (≤60% accuracy)
-- Each bin evaluated independently — no cascade, no monotonicity assumption
+- Each bin evaluated independently — no cascade assumption
+- Bayesian Beta-Binomial model after MIN_TRIALS_BEFORE_ABANDON (10) trials
+- Prior: Beta(1,1) — flat, no assumption about participant ability
+- Posterior: Beta(k+1, n-k+1) updated with observed responses
+- Abandon if P(true detection rate > 0.5 | data) < ABANDON_THRESHOLD (0.80)
+- At 10 trials: abandons if ≤5 correct (≤50% accuracy)
 
 Stopping rule
 -------------
 A staircase is complete when EITHER:
-  - All active (non-abandoned) bins have >= MIN_TRIALS_PER_BIN trials (converged), OR
-  - n_trials hard limit is reached
+  - All active (non-abandoned) bins have >= MIN_TRIALS_PER_BIN (15) trials, OR
+  - n_trials hard limit (400) is reached
 """
 
 import math
@@ -70,7 +78,7 @@ class StaircaseBlock:
         self.condition            = condition
         self.n_trials             = n_trials
         self.MIN_TRIALS_PER_BIN   = min_trials_per_bin
-        self.MIN_TRIALS_BEFORE_ABANDON = 15   # same as convergence criterion
+        self.MIN_TRIALS_BEFORE_ABANDON = 10   # same as convergence criterion
         self.ABANDON_THRESHOLD    = 0.80      # P(above chance) must exceed this to keep bin
         self.rng                  = random.Random(seed)
         self.np_rng               = np.random.default_rng(seed)
@@ -83,7 +91,7 @@ class StaircaseBlock:
         n_bins             = len(self.ecc_grid)
 
         # Per-bin state
-        self.threshold_est = np.full(n_bins, 15.0)   # start at mid-range magnitude
+        self.threshold_est = np.full(n_bins, 20.0)   # start at mid-range magnitude
         self.threshold_n   = np.zeros(n_bins)         # trials per bin
         self._correct_counts = np.zeros(n_bins)
         self._total_counts   = np.zeros(n_bins)
@@ -93,6 +101,8 @@ class StaircaseBlock:
         self._last_correct = {}    # bin_idx -> last bool response
         self._reversals    = {}    # bin_idx -> reversal count
         self._step_size    = 3.0  # starting step size in degrees
+        self._consecutive_correct = {}    # bin_idx -> consecutive correct count
+
 
         # Trial history
         self.history: List[dict] = []
@@ -167,17 +177,27 @@ class StaircaseBlock:
         self._total_counts[idx]   += 1
         self._correct_counts[idx] += int(correct)
 
-        # --- 1-up/1-down threshold update ---
+        # --- 2-up/1-down threshold update ---
         step = self._get_step(idx)
+
+        # Track consecutive correct responses
         if correct:
-            self.threshold_est[idx] = max(
-                float(self.available_magnitudes[0]),
-                self.threshold_est[idx] - step
-            )
+            self._consecutive_correct[idx] = self._consecutive_correct.get(idx, 0) + 1
         else:
+            self._consecutive_correct[idx] = 0
+
+        if not correct:
+            # 1 wrong → increase magnitude (easier)
             self.threshold_est[idx] = min(
                 float(self.available_magnitudes[-1]),
                 self.threshold_est[idx] + step
+            )
+        elif self._consecutive_correct[idx] >= 2:
+            # 2 consecutive correct → decrease magnitude (harder)
+            self._consecutive_correct[idx] = 0
+            self.threshold_est[idx] = max(
+                float(self.available_magnitudes[0]),
+                self.threshold_est[idx] - step
             )
 
         # Track reversals for step-size halving
@@ -203,7 +223,7 @@ class StaircaseBlock:
                 )
 
     def _get_step(self, idx: int) -> float:
-        """Step size halves after every 2 reversals, minimum 1°."""
+        """Step size halves after every 2 reversals, minimum 1°. Part of 2-up/1-down rule."""
         rev = self._reversals.get(idx, 0)
         halvings = rev // 2
         return max(1.0, self._step_size / (2 ** halvings))

@@ -1,0 +1,6 @@
+"0","tibble("
+"0","  x = seq(-10, 10, length.out = 100),"
+"0","  y = pm_func(x, dprime = 0.5, lapse = 0.05, bias = 0.6)"
+"0",") |> "
+"0","  ggplot(aes(x, y)) +"
+"0","  geom_line()"
