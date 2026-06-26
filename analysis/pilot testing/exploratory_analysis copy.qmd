@@ -1,0 +1,610 @@
+---
+title: "Exploratory Analysis — Peripheral Gaze-Change Detection"
+author: "Amira Shymbolatova"
+subtitle: "Master's Thesis — University of Twente, 2026"
+date: last-modified
+format: html
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Setup
+
+```{r}
+library(tidyverse)
+
+# ---- CHANGE THESE TWO LINES FOR EACH PARTICIPANT ----
+TRIALS_FILE <- "/Users/amira/Desktop/Experiment setup Final/Data/Participant 45/trials_part45.csv"                 # #your trials CSV filename
+PARTICIPANT_ID <- "45"   # participant label
+```
+
+# Data preparation
+
+Reads the trials CSV, filters to valid trials only (fixation compliance and tracking quality), 
+and converts variables to correct types.
+```{r}
+D_0 <- read_csv(TRIALS_FILE, show_col_types = FALSE)
+
+D_1 <- D_0 |>
+  filter(valid == 1) |>
+  mutate(
+    Part        = as.factor(PARTICIPANT_ID),
+    condition   = as.factor(condition),
+    eccentricity = as.numeric(eccentricity),
+    magnitude   = as.numeric(magnitude),
+    correct     = as.numeric(correct)
+  ) |>
+  group_by(condition) |>
+  mutate(trial = row_number()) |>
+  ungroup() |>
+  select(Part, trial, condition, eccentricity, magnitude, correct,
+         srt_ms, keyboard_rt_ms, pre_change_ms)
+
+summary(D_1)
+```
+
+## Participant rejection criteria
+
+Two criteria must both be met to keep a participant:
+1. Overall accuracy > 55% in both conditions (above chance)
+2. Negative Spearman correlation between eccentricity and accuracy < -0.3 (monotonic decrease)
+
+Participants failing either criterion are flagged for exclusion.
+
+```{r}
+# Check if participant shows above-chance performance overall
+overall_acc <- D_1 |>
+  group_by(condition) |>
+  summarize(
+    mean_correct = mean(correct),
+    n_trials     = n(),
+    above_chance = mean(correct) > 0.55
+  )
+
+cat("Overall accuracy by condition:\n")
+print(overall_acc)
+
+# Check monotonicity: does accuracy decrease with eccentricity?
+monotonicity <- D_1 |>
+  group_by(condition, eccentricity) |>
+  summarize(p_correct = mean(correct), .groups = "drop") |>
+  group_by(condition) |>
+  summarize(
+    cor_with_ecc = cor(eccentricity, p_correct, method = "spearman"),
+    monotone_decreasing = cor(eccentricity, p_correct, method = "spearman") < -0.3
+  )
+
+cat("\nMonotonicity check (should be negative correlation):\n")
+print(monotonicity)
+
+# Overall rejection decision
+reject <- any(!overall_acc$above_chance) | any(!monotonicity$monotone_decreasing)
+cat("\nParticipant rejection flag:", ifelse(reject, "CONSIDER REJECTION", "KEEP"), "\n")
+```
+
+# Exploration
+
+## Detection accuracy by eccentricity
+
+Shows the sigmoid decrease in detection accuracy as eccentricity increases. 
+Control and QuadBright conditions shown separately.
+Dashed line = chance level (50%) for 2AFC task.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+
+T_1 <- D_1 |>
+  summarize(
+    p_correct = mean(correct),
+    n_Obs     = n(),
+    .by       = c(condition, eccentricity)
+  )
+
+T_1 |>
+  ggplot(aes(x = eccentricity, 
+             color = condition, 
+             y = p_correct)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", 
+             color = "gray50") +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8) +
+  scale_y_continuous(limits = c(0.3, 1.05),
+                     labels = scales::percent_format()) +
+  scale_color_manual(values = c("control" = "#2196F3", 
+                                "quadbright" = "#FF5722")) +
+  labs(
+    title    = paste("Proportion correct by eccentricity —", PARTICIPANT_ID),
+    subtitle = "Dashed line = chance (50%)",
+    x        = "Eccentricity (degrees from fixation)",
+    y        = "Proportion correct",
+    color    = "Condition",
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Detection accuracy by gaze-change magnitude
+
+Shows how detection accuracy increases with gaze-change magnitude.
+Larger gaze changes are easier to detect regardless of eccentricity.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+
+T_2 <- D_1 |>
+  mutate(
+    Magnitude_range = case_when(
+      magnitude < 5 ~ "(1-5°)",
+      magnitude < 10 ~ "(5-10°)",
+      magnitude < 15 ~ "(10-15°)",
+      magnitude < 20 ~ "(15-20°)",
+      magnitude < 25 ~ "(20-25°)",
+      TRUE ~ "(25-30°)"
+    ),
+    Magnitude_range = factor(Magnitude_range, 
+                             levels = c("(1-5°)", 
+                                        "(5-10°)", 
+                                        "(10-15°)",
+                                        "(15-20°)",
+                                        "(20-25°)",
+                                        "(25-30°)"))
+  ) |>
+  summarize(
+    p_correct = mean(correct),
+    n_Obs     = n(),
+    .by       = c(condition, Magnitude_range)
+  )
+
+T_2 |>
+  ggplot(aes(x = Magnitude_range,
+             y = p_correct,
+             fill = condition)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  scale_y_continuous(limits = c(0, 1.05),
+                     labels = scales::percent_format()) +
+  scale_fill_manual(values = c("control" = "#2196F3",
+                               "quadbright" = "#FF5722")) +
+  labs(
+    title    = paste("Proportion correct by magnitude range —", PARTICIPANT_ID),
+    x        = "Gaze-change magnitude range",
+    y        = "Proportion correct",
+    fill     = "Condition"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Detection accuracy by eccentricity and magnitude range
+
+Used for participant rejection criterion assessment.
+Curves should show monotonic decrease toward 50% chance level with increasing eccentricity.
+Non-monotonic or flat curves indicate non-compliance.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+
+D_1 |>
+  mutate(Magnitude_range = case_when(
+    magnitude < 10 ~ "small (1-9°)",
+    magnitude < 20 ~ "medium (10-19°)",
+    TRUE           ~ "large (20-30°)"
+  ),
+  Magnitude_range = factor(Magnitude_range,
+                           levels = c("small (1-9°)", 
+                                      "medium (10-19°)", 
+                                      "large (20-30°)"))) |>
+  summarize(
+    p_correct = mean(correct),
+    n_Obs     = n(),
+    .by       = c(Part, condition, Magnitude_range, eccentricity)
+  ) |>
+  ggplot(aes(x = eccentricity,
+             color = condition,
+             y = p_correct)) +
+  facet_wrap(~Magnitude_range, nrow = 2) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  geom_smooth(se = FALSE, method = "loess", span = 1.0) +
+  scale_y_continuous(limits = c(0.2, 1.05),
+                     labels = scales::percent_format()) +
+  scale_color_manual(values = c("control" = "#2196F3",
+                                "quadbright" = "#FF5722")) +
+  labs(
+    title    = paste("Detection by eccentricity and magnitude —", PARTICIPANT_ID),
+    subtitle = "Participant rejection: curve should be monotonically decreasing toward 50%",
+    x        = "Eccentricity (degrees from fixation)",
+    y        = "Proportion correct",
+    color    = "Condition"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Keyboard reaction time analysis
+
+Keyboard RT is measured from gaze-change onset to keypress.
+Note: includes fixed 400ms post-change display period.
+Differences between conditions and eccentricities remain interpretable.
+
+```{r}
+T_3 <- D_1 |>
+  filter(!is.na(keyboard_rt_ms)) |>
+  group_by(condition, eccentricity) |>
+  summarize(
+    mean_rt  = mean(keyboard_rt_ms),
+    sd_rt    = sd(keyboard_rt_ms),
+    n_Obs    = n(),
+    .groups  = "drop"
+  )
+
+T_3 |>
+  ggplot(aes(x = eccentricity,
+             y = mean_rt,
+             color = condition)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8) +
+  scale_color_manual(values = c("control" = "#2196F3",
+                                "quadbright" = "#FF5722")) +
+  labs(
+    title    = paste("Keyboard RT by eccentricity —", PARTICIPANT_ID),
+    subtitle = "Expected: RT increases with eccentricity",
+    x        = "Eccentricity (degrees from fixation)",
+    y        = "Mean keyboard RT (ms)",
+    color    = "Condition"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Keyboard RT by gaze-change magnitude
+
+Tests H4: RT should decrease as gaze-change magnitude increases.
+Larger gaze changes are more salient and should trigger faster responses.
+QuadBright expected to show slower RT than control (H6).
+
+```{r}
+## Keyboard RT by magnitude
+
+T_4 <- D_1 |>
+  filter(!is.na(keyboard_rt_ms)) |>
+  group_by(condition, magnitude) |>
+  summarize(
+    mean_rt = mean(keyboard_rt_ms),
+    n_Obs   = n(),
+    .groups = "drop"
+  )
+
+T_4 |>
+  ggplot(aes(x = magnitude,
+             y = mean_rt,
+             color = condition)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8) +
+  scale_color_manual(values = c("control" = "#2196F3",
+                                "quadbright" = "#FF5722")) +
+  labs(
+    title    = paste("Keyboard RT by gaze-change magnitude —", PARTICIPANT_ID),
+    subtitle = "Expected: RT decreases as magnitude increases",
+    x        = "Gaze-change magnitude (degrees)",
+    y        = "Mean keyboard RT (ms)",
+    color    = "Condition"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Keyboard RT by eccentricity and magnitude range
+
+Combined view of RT across both eccentricity and magnitude.
+Each panel shows a different magnitude range — allows assessment of 
+whether the eccentricity effect on RT depends on magnitude size.
+Expected: eccentricity effect strongest for small magnitudes where 
+detection is more demanding.
+
+```{r}
+## Keyboard RT by eccentricity and magnitude range
+
+D_1 |>
+  filter(!is.na(keyboard_rt_ms)) |>
+  mutate(Magnitude_range = case_when(
+    magnitude < 10 ~ "small (1-9°)",
+    magnitude < 20 ~ "medium (10-19°)",
+    TRUE           ~ "large (20-30°)"
+  ),
+  Magnitude_range = factor(Magnitude_range,
+                           levels = c("small (1-9°)",
+                                      "medium (10-19°)",
+                                      "large (20-30°)"))) |>
+  group_by(condition, Magnitude_range, eccentricity) |>
+  summarize(mean_rt = mean(keyboard_rt_ms), .groups = "drop") |>
+  ggplot(aes(x = eccentricity,
+             y = mean_rt,
+             color = condition)) +
+  facet_wrap(~Magnitude_range) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  geom_smooth(se = FALSE, method = "loess", span = 1.0) +
+  scale_color_manual(values = c("control" = "#2196F3",
+                                "quadbright" = "#FF5722")) +
+  labs(
+    title    = paste("Keyboard RT by eccentricity and magnitude —", PARTICIPANT_ID),
+    x        = "Eccentricity (degrees from fixation)",
+    y        = "Mean keyboard RT (ms)",
+    color    = "Condition"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Keyboard RT by pre-change interval (exploratory)
+Tests whether temporal preparation affects RT.
+Longer waiting time may lead to faster responses due to anticipation.
+
+```{r}
+## Keyboard RT by pre-change interval
+
+T_5 <- D_1 |>
+  filter(!is.na(keyboard_rt_ms)) |>
+  group_by(condition) |>
+  mutate(pre_change_bin = cut(pre_change_ms, 
+                               breaks = 5,
+                               labels = c("800-940", "940-1080", 
+                                         "1080-1220", "1220-1360", 
+                                         "1360-1500")))
+
+T_5 |>
+  ggplot(aes(x = pre_change_ms,
+             y = keyboard_rt_ms,
+             color = condition)) +
+  geom_point(size = 1.5, alpha = 0.3) +
+  geom_smooth(se = FALSE, method = "lm") +
+  scale_color_manual(values = c("control" = "#2196F3",
+                                "quadbright" = "#FF5722")) +
+  labs(
+    title    = paste("Keyboard RT by pre-change interval —", PARTICIPANT_ID),
+    subtitle = "Exploratory: longer wait may lead to faster RT (temporal preparation)",
+    x        = "Pre-change interval (ms)",
+    y        = "Keyboard RT (ms)",
+    color    = "Condition"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+
+## Participant rejection criteria
+
+Two criteria must both be met to keep a participant:
+1. Overall accuracy > 55% in both conditions (above chance)
+2. Negative Spearman correlation between eccentricity and accuracy < -0.3 (monotonic decrease)
+
+Participants failing either criterion are flagged for exclusion.
+
+```{r}
+# Check if participant shows above-chance performance overall
+overall_acc <- D_1 |>
+  group_by(condition) |>
+  summarize(
+    mean_correct = mean(correct),
+    n_trials     = n(),
+    above_chance = mean(correct) > 0.55
+  )
+
+cat("Overall accuracy by condition:\n")
+print(overall_acc)
+
+# Check monotonicity: does accuracy decrease with eccentricity?
+monotonicity <- D_1 |>
+  group_by(condition, eccentricity) |>
+  summarize(p_correct = mean(correct), .groups = "drop") |>
+  group_by(condition) |>
+  summarize(
+    cor_with_ecc = cor(eccentricity, p_correct, method = "spearman"),
+    monotone_decreasing = cor(eccentricity, p_correct, method = "spearman") < -0.3
+  )
+
+cat("\nMonotonicity check (should be negative correlation):\n")
+print(monotonicity)
+
+# Overall rejection decision
+reject <- any(!overall_acc$above_chance) | any(!monotonicity$monotone_decreasing)
+cat("\nParticipant rejection flag:", ifelse(reject, "CONSIDER REJECTION", "KEEP"), "\n")
+```
+
+## Statistical model — Detection accuracy
+
+Simplified psychometric function following Schmettow et al. (2026).
+dprime models sensitivity as a function of magnitude, eccentricity, condition and pre-change interval.
+Guess rate fixed at 0.5 (2AFC). Lapse rate and bias omitted (simplified model).
+Random intercept and slope for eccentricity per participant.
+
+```{r}
+#| eval: false
+
+# Install bayr if needed:
+# devtools::install_github("schmettow/bayr")
+
+library(brms)
+library(bayr)
+
+# Inverse logit helper (from supervisor's code)
+inv_logit <- function(x) exp(x) / (1 + exp(x))
+
+
+F_1 <- bf(
+  correct ~ 0.5 + (1 - 0.5) * inv_logit(exp(dprime) * magnitude),
+  dprime ~ 1 + eccentricity + condition + pre_change_ms +
+           (1 + eccentricity | Part),
+  nl = TRUE
+)
+
+
+### add the lapse parameter 
+
+# Priors (from supervisor's code)
+Priors_1 <- c(
+  set_prior("normal(0, 1)", nlpar = "dprime")
+)
+
+# Fit model
+M_1 <- brm(
+  F_1,
+  data   = D_1,
+  family = bernoulli(link = "identity"),
+  prior  = Priors_1,
+  chains = 4,
+  cores  = 4,
+  iter   = 3000,
+  warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 12)
+)
+
+save(M_1, D_1, file = "M_1_pilot.Rda")
+```
+
+```{r}
+library(bayr)
+load("M_1_pilot.Rda")
+P_1 <- bayr::posterior(M_1)
+fixef(P_1)
+```
+
+```{r}
+P_1 |> 
+  filter(type == "fixef") |> 
+  ggplot(aes(x = value, col = parameter)) +
+  facet_grid(~nonlin) +
+  geom_density()
+```
+
+## Posterior predictions
+
+```{r}
+PP_1 <- bayr::post_pred(M_1, ndraws = 1000)
+```
+
+
+## Statistical model — Keyboard reaction time
+
+Secondary outcome model following the preregistered analysis plan.
+Keyboard RT is modelled on the log scale using a Gaussian (log-normal) likelihood,
+as RT distributions are typically positively skewed.
+
+
+```{r}
+#| eval: false
+
+D_RT <- D_1 |>
+  filter(!is.na(keyboard_rt_ms), correct == 1) |>  # valid correct trials only
+  mutate(
+    log_rt = log(keyboard_rt_ms),
+    pre_change_ms_z = scale(pre_change_ms)[,1]
+  )
+
+F_RT <- bf(
+  log_rt ~ 1 + eccentricity + condition + pre_change_ms_z +
+            (1 + eccentricity | Part)
+)
+
+Priors_RT <- c(
+  set_prior("normal(6, 1)", class = "Intercept"),  # log(400ms) ≈ 6
+  set_prior("normal(0, 0.5)", class = "b")
+)
+
+M_2 <- brm(
+  F_RT,
+  data   = D_RT,
+  family = gaussian(),
+  prior  = Priors_RT,
+  chains = 4,
+  cores  = 4,
+  iter   = 3000,
+  warmup = 2000
+)
+
+save(M_2, D_RT, file = "M_2_pilot.Rda")
+```
+
+
+```{r}
+library(bayr)
+load("M_2_pilot.Rda")
+P_2 <- bayr::posterior(M_2)
+fixef(P_2)
+```
+
+Coefficients are on the log scale. To interpret:
+- Positive coefficient → longer RT
+- Negative coefficient → shorter RT  
+- To convert to percentage change: (exp(coefficient) - 1) × 100%
+
+## Rejection example — non-compliant participant
+
+Simulate a non-compliant participant
+Non-monotonic curve: performance goes up and down randomly
+Overall accuracy near chance
+
+```{r}
+
+set.seed(42)
+n_ecc <- 26  # 5 to 30 degrees
+
+D_reject <- tibble(
+  eccentricity = rep(5:30, times = 2),
+  condition = rep(c("control", "quadbright"), each = 26),
+  # Non-monotonic: random performance around 55-65% with no clear trend
+  p_correct = c(
+    sample(c(0.50, 0.53, 0.60, 0.67, 0.55, 0.70, 0.50, 0.58, 
+             0.63, 0.50, 0.50, 0.55, 0.50, 0.60, 0.50, 0.67,
+             0.50, 0.60, 0.55, 0.53, 0.67, 0.50, 0.55, 0.60,
+             0.53, 0.50), 26),
+    sample(c(0.53, 0.50, 0.58, 0.63, 0.50, 0.55, 0.67, 0.50,
+             0.55, 0.60, 0.53, 0.50, 0.67, 0.55, 0.50, 0.60,
+             0.53, 0.67, 0.50, 0.55, 0.60, 0.50, 0.50, 0.67,
+             0.50, 0.50), 26)
+  ),
+  n_Obs = 15
+)
+
+D_reject |>
+  ggplot(aes(x = eccentricity,
+             color = condition,
+             y = p_correct)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  geom_point(size = 2, alpha = 0.6) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8) +
+  scale_y_continuous(limits = c(0.2, 1.05),
+                     labels = scales::percent_format()) +
+  scale_color_manual(values = c("control" = "#2196F3",
+                                "quadbright" = "#FF5722")) +
+  labs(
+    title    = "Rejection example — non-compliant participant",
+    subtitle = "Non-monotonic curve, performance near chance → REJECT",
+    x        = "Eccentricity (degrees from fixation)",
+    y        = "Detection accuracy",
+    color    = "Condition"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Rejection check on simulated non-compliant participant
+overall_acc_reject <- D_reject |>
+  group_by(condition) |>
+  summarize(
+    mean_correct = mean(p_correct),
+    n_trials     = n(),
+    above_chance = mean(p_correct) > 0.55
+  )
+cat("Overall accuracy by condition:\n")
+print(overall_acc_reject)
+
+monotonicity_reject <- D_reject |>
+  group_by(condition, eccentricity) |>
+  summarize(p_correct = mean(p_correct), .groups = "drop") |>
+  group_by(condition) |>
+  summarize(
+    cor_with_ecc = cor(eccentricity, p_correct, method = "spearman"),
+    monotone_decreasing = cor(eccentricity, p_correct, method = "spearman") < -0.3
+  )
+cat("\nMonotonicity check (should be negative correlation):\n")
+print(monotonicity_reject)
+
+reject <- any(!overall_acc_reject$above_chance) | any(!monotonicity_reject$monotone_decreasing)
+cat("\nParticipant rejection flag:", ifelse(reject, "CONSIDER REJECTION", "KEEP"), "\n")
+```

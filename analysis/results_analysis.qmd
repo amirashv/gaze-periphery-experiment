@@ -1,0 +1,523 @@
+---
+title: "Results — Peripheral Gaze-Change Detection"
+author: "Amira Shymbolatova"
+subtitle: "Master's Thesis — University of Twente, 2026"
+date: last-modified
+format: html
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(purrr)
+
+# ---- SET THIS TO THE PARENT FOLDER CONTAINING ALL PARTICIPANT SUB-FOLDERS ----
+DATA_DIR <- "/Users/amira/Desktop/Experiment setup Final/Data"
+
+# ---- TECHNICAL EXCLUSIONS (manual, by documented cause) ----
+# List the participant numbers whose SESSION FAILED for a technical reason
+# (e.g. software freeze mid-session, eye-tracker failure, terminated early).
+# Record the reason next to each ID. These are excluded BEFORE analysis.
+# NOTE: this is a documented-cause list, NOT a trial-count cutoff. The trial
+# count is reported later as evidence of the failure, not as the exclusion rule.
+TECHNICAL_EXCLUSIONS <- c(2, 9, 27, 32, 35, 42
+  # 12,   # froze after block 2 (~400 trials), could not resume
+  # 27    # eye-tracker lost calibration, session terminated
+)
+```
+
+# Data reading and pooling
+
+Reads `trials_partN.csv` from every `Participant N` sub-folder, tags each row
+with its participant ID, and stacks them. Valid-trial filtering (fixation +
+tracking) is applied here so every downstream step uses valid trials only.
+
+```{r}
+# Find all participant folders and their trials files
+participant_folders <- list.dirs(DATA_DIR, recursive = FALSE)
+
+read_one <- function(folder) {
+  pid <- str_extract(basename(folder), "\\d+")
+  if (is.na(pid)) return(NULL)
+  f <- file.path(folder, paste0("trials_part", pid, ".csv"))
+  if (!file.exists(f)) return(NULL)
+  read_csv(f, show_col_types = FALSE) |>
+    mutate(Part = pid)
+}
+
+D_raw <- map_dfr(participant_folders, read_one)
+
+# Remove technically-failed participants (documented cause)
+D_raw <- D_raw |>
+  filter(!(as.numeric(Part) %in% TECHNICAL_EXCLUSIONS))
+
+# Keep valid trials only (fixation compliance + tracking quality), set types
+D_valid <- D_raw |>
+  filter(valid == 1) |>
+  mutate(
+    Part         = as.factor(Part),
+    condition    = as.factor(condition),
+    eccentricity = as.numeric(eccentricity),
+    magnitude    = as.numeric(magnitude),
+    correct      = as.numeric(correct)
+  ) |>
+  select(Part, condition, eccentricity, magnitude, correct,
+         srt_ms, keyboard_rt_ms, pre_change_ms)
+
+cat("Participants after technical exclusion:", n_distinct(D_valid$Part), "\n")
+cat("Total valid trials pooled:", nrow(D_valid), "\n")
+```
+
+# Participant-level rejection criteria
+
+Applies the two preregistered criteria to EACH participant:
+1. Overall accuracy > 55% in BOTH conditions.
+2. Spearman correlation (eccentricity vs proportion correct) < -0.3 in BOTH conditions.
+A participant is KEPT only if both criteria pass in both conditions.
+
+```{r}
+# Per-participant, per-condition accuracy
+acc_check <- D_valid |>
+  group_by(Part, condition) |>
+  summarize(mean_correct = mean(correct), .groups = "drop")
+
+# Per-participant, per-condition Spearman(ecc, p_correct)
+spear_check <- D_valid |>
+  group_by(Part, condition, eccentricity) |>
+  summarize(p_correct = mean(correct), .groups = "drop") |>
+  group_by(Part, condition) |>
+  summarize(
+    spearman = suppressWarnings(
+      cor(eccentricity, p_correct, method = "spearman")
+    ),
+    .groups = "drop"
+  )
+
+# Combine and decide per participant
+rejection <- acc_check |>
+  left_join(spear_check, by = c("Part", "condition")) |>
+  group_by(Part) |>
+  summarize(
+    min_acc        = min(mean_correct),
+    max_spearman   = max(spearman, na.rm = TRUE),   # worst (least negative)
+    acc_pass       = all(mean_correct > 0.55),
+    spear_pass     = all(spearman < -0.3),
+    .groups        = "drop"
+  ) |>
+  mutate(decision = if_else(acc_pass & spear_pass, "KEEP", "REJECT"))
+
+print(rejection, n = Inf)
+
+kept_ids <- rejection |> filter(decision == "KEEP") |> pull(Part)
+cat("\nKept after rejection criteria:", length(kept_ids), "participants\n")
+```
+
+```{r}
+# Final analysis dataset: kept participants only
+D_1 <- D_valid |> filter(Part %in% kept_ids) |> droplevels()
+
+cat("Final cohort:", n_distinct(D_1$Part), "participants\n")
+cat("Final valid trials (accuracy dataset):", nrow(D_1), "\n")
+```
+
+# Participant flow summary
+
+A compact table for the Results "participant flow" paragraph: recruited,
+technical exclusions, rejection-criteria exclusions, final.
+
+```{r}
+n_recruited <- length(participant_folders)
+n_technical <- length(TECHNICAL_EXCLUSIONS)
+n_rejected  <- sum(rejection$decision == "REJECT")
+n_final     <- length(kept_ids)
+
+flow <- tibble(
+  stage = c("Recruited", "Excluded: technical failure",
+            "Excluded: rejection criteria", "Final analysed"),
+  n = c(n_recruited, n_technical, n_rejected, n_final)
+)
+print(flow)
+```
+
+# Descriptive statistics
+
+Descriptive summaries in the preregistered/preferred format, reported per
+condition for the two outcome measures (accuracy, keyboard RT).
+
+```{r}
+# Reusable summary function in the preferred column layout
+describe <- function(x) {
+  x_noNA <- x[!is.na(x)]
+  q <- quantile(x_noNA, probs = c(.25, .5, .75))
+  tibble(
+    n        = length(x),
+    missing  = sum(is.na(x)),
+    mean     = mean(x_noNA),
+    median   = median(x_noNA),
+    sd       = sd(x_noNA),
+    variance = var(x_noNA),
+    minimum  = min(x_noNA),
+    quartile_1 = q[[1]],
+    quartile_2 = q[[2]],
+    quartile_3 = q[[3]],
+    maximum  = max(x_noNA),
+    iqr      = IQR(x_noNA),
+    range    = max(x_noNA) - min(x_noNA)
+  )
+}
+
+# Accuracy (correct, 0/1) per condition
+desc_accuracy <- D_1 |>
+  group_by(condition) |>
+  group_modify(~ describe(.x$correct)) |>
+  ungroup()
+cat("Descriptives — detection accuracy (proportion correct units):\n")
+print(desc_accuracy)
+
+# Keyboard RT per condition (RT dataset rules: correct only, RT <= 3000)
+desc_rt <- D_1 |>
+  filter(correct == 1, !is.na(keyboard_rt_ms), keyboard_rt_ms <= 3000) |>
+  group_by(condition) |>
+  group_modify(~ describe(.x$keyboard_rt_ms)) |>
+  ungroup()
+cat("\nDescriptives — keyboard RT (ms):\n")
+print(desc_rt)
+```
+
+```{r}
+# Mean accuracy and mean RT per condition AND eccentricity bin (prereg promise)
+desc_by_ecc <- D_1 |>
+  group_by(condition, eccentricity) |>
+  summarize(
+    n_trials  = n(),
+    mean_acc  = mean(correct),
+    mean_rt   = mean(keyboard_rt_ms[correct == 1 & keyboard_rt_ms <= 3000],
+                     na.rm = TRUE),
+    .groups   = "drop"
+  )
+print(desc_by_ecc, n = Inf)
+```
+
+# Exploratory figures
+
+All figures below are exploratory/descriptive (per preregistration), shown
+before the confirmatory models to characterise the pattern of results.
+
+## Accuracy by eccentricity, by condition  (H1, H5, H7)
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+D_1 |>
+  summarize(p_correct = mean(correct), n_Obs = n(),
+            .by = c(condition, eccentricity)) |>
+  ggplot(aes(x = eccentricity, y = p_correct, color = condition)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  geom_point(aes(size = n_Obs), alpha = 0.5) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8) +
+  scale_y_continuous(limits = c(0.3, 1.05), labels = scales::percent_format()) +
+  scale_color_manual(values = c("control" = "#2196F3", "quadbright" = "#FF5722")) +
+  labs(title = "Proportion correct by eccentricity (all participants)",
+       subtitle = "Dashed line = chance (50%)",
+       x = "Eccentricity (deg)", y = "Proportion correct",
+       color = "Condition", size = "N trials") +
+  theme_minimal(base_size = 13)
+```
+
+## Accuracy by magnitude range, by condition  (H3)
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+D_1 |>
+  mutate(Magnitude_range = cut(magnitude,
+           breaks = c(0,5,10,15,20,25,30),
+           labels = c("1-5","5-10","10-15","15-20","20-25","25-30"),
+           include.lowest = TRUE)) |>
+  summarize(p_correct = mean(correct), n_Obs = n(),
+            .by = c(condition, Magnitude_range)) |>
+  ggplot(aes(x = Magnitude_range, y = p_correct, fill = condition)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  scale_y_continuous(limits = c(0,1.05), labels = scales::percent_format()) +
+  scale_fill_manual(values = c("control" = "#2196F3", "quadbright" = "#FF5722")) +
+  labs(title = "Proportion correct by magnitude range (all participants)",
+       x = "Gaze-change magnitude (deg)", y = "Proportion correct",
+       fill = "Condition") +
+  theme_minimal(base_size = 13)
+```
+
+## Keyboard RT by eccentricity, by condition  (H2, H6)
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+D_1 |>
+  filter(correct == 1, !is.na(keyboard_rt_ms), keyboard_rt_ms <= 3000) |>
+  group_by(condition, eccentricity) |>
+  summarize(mean_rt = mean(keyboard_rt_ms), n_Obs = n(), .groups = "drop") |>
+  ggplot(aes(x = eccentricity, y = mean_rt, color = condition)) +
+  geom_point(aes(size = n_Obs), alpha = 0.6) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8) +
+  scale_color_manual(values = c("control" = "#2196F3", "quadbright" = "#FF5722")) +
+  labs(title = "Keyboard RT by eccentricity (all participants)",
+       subtitle = "Correct trials, RT <= 3000 ms",
+       x = "Eccentricity (deg)", y = "Mean keyboard RT (ms)",
+       color = "Condition", size = "N trials") +
+  theme_minimal(base_size = 13)
+```
+
+## Keyboard RT by magnitude, by condition  (H4)
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+D_1 |>
+  filter(correct == 1, !is.na(keyboard_rt_ms), keyboard_rt_ms <= 3000) |>
+  group_by(condition, magnitude) |>
+  summarize(mean_rt = mean(keyboard_rt_ms), n_Obs = n(), .groups = "drop") |>
+  ggplot(aes(x = magnitude, y = mean_rt, color = condition)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8) +
+  scale_color_manual(values = c("control" = "#2196F3", "quadbright" = "#FF5722")) +
+  labs(title = "Keyboard RT by gaze-change magnitude (all participants)",
+       subtitle = "Expected: RT decreases as magnitude increases",
+       x = "Gaze-change magnitude (deg)", y = "Mean keyboard RT (ms)",
+       color = "Condition") +
+  theme_minimal(base_size = 13)
+```
+
+## Keyboard RT by pre-change interval  (H8, exploratory)
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+D_1 |>
+  filter(correct == 1, !is.na(keyboard_rt_ms), keyboard_rt_ms <= 3000) |>
+  ggplot(aes(x = pre_change_ms, y = keyboard_rt_ms, color = condition)) +
+  geom_point(size = 1, alpha = 0.2) +
+  geom_smooth(se = FALSE, method = "lm") +
+  scale_color_manual(values = c("control" = "#2196F3", "quadbright" = "#FF5722")) +
+  labs(title = "Keyboard RT by pre-change interval (all participants)",
+       subtitle = "Temporal preparation: longer wait may give faster RT",
+       x = "Pre-change interval (ms)", y = "Keyboard RT (ms)",
+       color = "Condition") +
+  theme_minimal(base_size = 13)
+```
+
+# Confirmatory model 1 — Detection accuracy
+
+Simplified psychometric function (Schmettow et al.). Sensitivity (dprime)
+modelled as a function of eccentricity, condition, and pre-change interval;
+magnitude enters the psychometric function directly as signal strength.
+Guess rate fixed at 0.5 (2AFC). No lapse, no bias, no interactions
+(per preregistration). Random intercept + eccentricity slope per participant.
+
+Continuous predictors are mean-centred (eccentricity, magnitude) and the
+pre-change interval is z-scored, exactly as preregistered.
+
+```{r}
+#| eval: false
+library(brms)
+
+inv_logit <- function(x) exp(x) / (1 + exp(x))
+
+D_acc <- D_1 |>
+  mutate(
+    ecc_c = as.numeric(scale(eccentricity, scale = FALSE)),  # centred (linear predictor)
+    pre_z = as.numeric(scale(pre_change_ms))                 # z-scored
+    # magnitude stays RAW — it is the signal-strength term
+  )
+
+F_1 <- bf(
+  correct ~ 0.5 + (1 - 0.5) * inv_logit(exp(dprime) * magnitude),
+  dprime ~ 1 + ecc_c + condition + pre_z + (1 + ecc_c | Part),
+  nl = TRUE
+)
+
+Priors_1 <- c(
+  set_prior("normal(0, 1)", nlpar = "dprime")
+)
+
+M_1 <- brm(
+  F_1,
+  data    = D_acc,
+  family  = bernoulli(link = "identity"),
+  prior   = Priors_1,
+  chains  = 4,
+  cores   = 4,
+  iter    = 3000,
+  warmup  = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 12),
+  seed    = 1
+)
+
+save(M_1, D_acc, file = "/Users/amira/Desktop/Experiment setup Final/analysis/M_1_results.Rda")
+
+# 1. Did D_acc actually get built with the centred variables?
+names(D_acc)               # must include mag_c, ecc_c, pre_z
+sum(is.na(D_acc$mag_c))    # NAs here will break the non-linear fit
+
+# 2. Is the outcome strictly 0/1?
+table(D_acc$correct)
+```
+
+```{r}
+#| eval: false
+# Diagnostics
+library(brms)
+load("/Users/amira/Desktop/Experiment setup Final/analysis/M_1_results.Rda")
+summary(M_1)              # R-hat and ESS in the output
+plot(M_1)                 # trace plots
+```
+
+```{r}
+#| eval: false
+# Posterior summaries (mean, median, 95% CrI, P(direction))
+library(posterior)
+as_draws_df(M_1) |>
+  select(starts_with("b_dprime")) |>
+  summarise_draws(
+    mean, median,
+    ~quantile(.x, 0.025), ~quantile(.x, 0.975),
+    p_negative = ~mean(.x < 0),
+    p_positive = ~mean(.x > 0)
+  )
+```
+
+# Confirmatory model 2 — Keyboard reaction time
+
+Log-normal multilevel model on correct trials with RT <= 3000 ms.
+Fixed effects: eccentricity, condition, magnitude, pre-change interval
+(all four, per preregistration). Random intercept + eccentricity slope
+per participant. Continuous predictors mean-centred; pre-change z-scored.
+
+```{r}
+#| eval: false
+library(brms)
+
+D_RT <- D_1 |>
+  filter(correct == 1, !is.na(keyboard_rt_ms), keyboard_rt_ms <= 3000) |>
+  mutate(
+    log_rt = log(keyboard_rt_ms),
+    ecc_c  = as.numeric(scale(eccentricity, scale = FALSE)),
+    mag_c  = as.numeric(scale(magnitude,    scale = FALSE)),
+    pre_z  = as.numeric(scale(pre_change_ms))
+  )
+
+F_RT <- bf(
+  log_rt ~ 1 + ecc_c + condition + mag_c + pre_z + (1 + ecc_c | Part)
+)
+
+Priors_RT <- c(
+  set_prior("normal(6, 1)",   class = "Intercept"),  # log(~400ms) baseline
+  set_prior("normal(0, 0.5)", class = "b")
+)
+
+M_2 <- brm(
+  F_RT,
+  data   = D_RT,
+  family = gaussian(),          # log-normal via log_rt outcome
+  prior  = Priors_RT,
+  chains = 4,
+  cores  = 4,
+  iter   = 3000,
+  warmup = 2000,
+  seed   = 1
+)
+
+save(M_2, D_RT, file = "M_2_results.Rda")
+```
+
+```{r}
+#| eval: false
+library(brms)
+load("M_2_results.Rda")
+summary(M_2)
+plot(M_2)
+```
+
+```{r}
+#| eval: false
+library(posterior)
+as_draws_df(M_2) |>
+  select(starts_with("b_")) |>
+  summarise_draws(
+    mean, median,
+    ~quantile(.x, 0.025), ~quantile(.x, 0.975),
+    p_negative = ~mean(.x < 0),
+    p_positive = ~mean(.x > 0)
+  )
+# Coefficients are on the log scale.
+# Percentage change in RT per unit predictor: (exp(coef) - 1) * 100
+```
+
+
+
+# Exploratory two-way breakdowns
+The following figures are exploratory and descriptive only. They examine whether the eccentricity pattern differs across magnitude ranges. Because the confirmatory models include main effects only and no interaction terms, these breakdowns are not used to test any hypothesis and are presented purely to characterise the data.
+
+## Accuracy by eccentricity across magnitude ranges
+Detection accuracy is plotted against eccentricity within three magnitude bands (small, medium, large). This illustrates how the decline in accuracy with eccentricity appears at different signal strengths.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+D_1 |>
+  mutate(Magnitude_range = factor(
+    case_when(
+      magnitude < 10 ~ "small (1-9°)",
+      magnitude < 20 ~ "medium (10-19°)",
+      TRUE           ~ "large (20-30°)"
+    ),
+    levels = c("small (1-9°)", "medium (10-19°)", "large (20-30°)")
+  )) |>
+  summarize(p_correct = mean(correct), n_Obs = n(),
+            .by = c(condition, Magnitude_range, eccentricity)) |>
+  ggplot(aes(x = eccentricity, y = p_correct, color = condition)) +
+  facet_wrap(~Magnitude_range) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  geom_smooth(se = FALSE, method = "loess", span = 1.0) +
+  scale_y_continuous(limits = c(0.2, 1.05), labels = scales::percent_format()) +
+  scale_color_manual(values = c("control" = "#2196F3", "quadbright" = "#FF5722")) +
+  labs(title = "Exploratory: accuracy by eccentricity and magnitude range",
+       subtitle = "Descriptive only — no interaction is tested in the confirmatory models",
+       x = "Eccentricity (deg)", y = "Proportion correct", color = "Condition") +
+  theme_minimal(base_size = 12)
+```
+
+## Keyboard RT by eccentricity across magnitude ranges
+Keyboard reaction time (correct trials, RT ≤ 3000 ms) is plotted against eccentricity within the same three magnitude bands, showing how response speed varies with eccentricity at different signal strengths.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+D_1 |>
+  filter(correct == 1, !is.na(keyboard_rt_ms), keyboard_rt_ms <= 3000) |>
+  mutate(Magnitude_range = factor(
+    case_when(
+      magnitude < 10 ~ "small (1-9°)",
+      magnitude < 20 ~ "medium (10-19°)",
+      TRUE           ~ "large (20-30°)"
+    ),
+    levels = c("small (1-9°)", "medium (10-19°)", "large (20-30°)")
+  )) |>
+  group_by(condition, Magnitude_range, eccentricity) |>
+  summarize(mean_rt = mean(keyboard_rt_ms), .groups = "drop") |>
+  ggplot(aes(x = eccentricity, y = mean_rt, color = condition)) +
+  facet_wrap(~Magnitude_range) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  geom_smooth(se = FALSE, method = "loess", span = 1.0) +
+  scale_color_manual(values = c("control" = "#2196F3", "quadbright" = "#FF5722")) +
+  labs(title = "Exploratory: keyboard RT by eccentricity and magnitude range",
+       subtitle = "Correct trials, RT <= 3000 ms — descriptive only",
+       x = "Eccentricity (deg)", y = "Mean keyboard RT (ms)", color = "Condition") +
+  theme_minimal(base_size = 12)
+```
+
+
